@@ -1,0 +1,37 @@
+{
+  "name": "wechat-ai-bot",
+  "version": "2.0.0",
+  "description": "微信 AI 机器人 - 支持语音/表情包/图片识别",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot-full.js",
+    "simple": "node src/bot.js",
+    "voice": "node src/bot-voice.js",
+    "unicorn": "node src/bot-unicorn.js",
+    "test": "node test/test-api.js"
+  },
+  "keywords": [
+    "wechat",
+    "ai",
+    "chatbot",
+    "gemini",
+    "chatgpt",
+    "claude",
+    "voice",
+    "tts"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "@google/generative-ai": "^0.24.1",
+    "axios": "^1.13.6",
+    "dotenv": "^16.0.0",
+    "file-box": "^1.5.5",
+    "https-proxy-agent": "^7.0.6",
+    "moment": "^2.30.1",
+    "openai": "^4.0.0",
+    "sqlite3": "^5.1.7",
+    "wechaty": "^1.20.2"
+  }
+}

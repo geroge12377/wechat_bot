@@ -1,0 +1,641 @@
+import logging
+import multiprocessing
+import os
+import time
+import shutil
+import glob
+import warnings
+from datetime import datetime
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.cuda.amp import GradScaler, autocast
+from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+import modules.commons as commons
+import utils
+from data_utils import TextAudioCollate, TextAudioSpeakerLoader
+from models import (
+    MultiPeriodDiscriminator,
+    SynthesizerTrn,
+)
+from modules.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
+from modules.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+
+# === 初始化日志 ===
+print("==== 训练脚本开始执行 ====")
+print(f"工作目录: {os.getcwd()}")
+print(f"文件路径: {__file__}")
+print(f"Python版本: {os.sys.version}")
+
+# 过滤警告
+warnings.filterwarnings("ignore", category=UserWarning, message=".*torch.cuda.amp.autocast.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('numba').setLevel(logging.WARNING)
+
+torch.backends.cudnn.benchmark = True
+global_step = 0
+start_time = time.time()
+
+def setup_directories(hps):
+    """创建并验证所有必要的目录结构"""
+    # 确保基础目录存在
+    os.makedirs(hps.model_dir, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+    
+    # 创建版本化目录
+    version_dir = hps.train.tensorboard_log_dir
+    os.makedirs(version_dir, exist_ok=True)
+    
+    # 创建检查点目录
+    checkpoint_dir = hps.train.checkpoint_dir
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 创建模型保存目录
+    save_dir = hps.train.save_dir
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 移动错误位置的事件文件
+    moved_files = []
+    for event_file in glob.glob("events.out.tfevents.*"):
+        dest = os.path.join(version_dir, event_file)
+        try:
+            if os.path.exists(event_file):
+                shutil.move(event_file, dest)
+                moved_files.append(dest)
+        except Exception as e:
+            print(f" 移动文件失败: {e}")
+    
+    # 记录目录状态
+    setup_log_path = os.path.join(version_dir, "setup.log")
+    with open(setup_log_path, "w") as f:
+        f.write(f"Directory setup at {datetime.now()}\n")
+        f.write(f"TensorBoard log dir: {version_dir}\n")
+        f.write(f"Checkpoint dir: {checkpoint_dir}\n")
+        f.write(f"Model save dir: {save_dir}\n")
+        if moved_files:
+            f.write(f"Moved {len(moved_files)} event files to correct location\n")
+    
+    print(f" 目录设置完成:")
+    print(f"  - TensorBoard: {version_dir}")
+    print(f"  - Checkpoints: {checkpoint_dir}")
+    print(f"  - Models: {save_dir}")
+    
+    # 验证目录是否可写
+    test_file_path = os.path.join(version_dir, "write_test.txt")
+    try:
+        with open(test_file_path, "w") as f:
+            f.write("Directory write test - success\n")
+        os.remove(test_file_path)
+        print(" 目录写入权限验证通过")
+    except Exception as e:
+        print(f" 目录写入权限验证失败: {e}")
+        raise
+    
+    return {
+        "version_dir": version_dir,
+        "checkpoint_dir": checkpoint_dir,
+        "save_dir": save_dir
+    }
+
+def main():
+    """主训练函数 - 单节点多GPU训练"""
+    assert torch.cuda.is_available(), "CPU训练不被支持"
+    hps = utils.get_hparams()
+    
+    # ====== 目录设置 ======
+    print(" 正在设置目录结构...")
+    dirs = setup_directories(hps)
+    # =====================
+    
+    n_gpus = torch.cuda.device_count()
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = hps.train.port
+
+    try:
+        # 启动多进程训练
+        mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps, dirs))
+    except KeyboardInterrupt:
+        print("\n 训练被用户中断 - 程序退出")
+    except Exception as e:
+        print(f" 训练遇到错误: {e}")
+        raise
+    finally:
+        print(" 清理资源...")
+
+def run(rank, n_gpus, hps, dirs):
+    """每个GPU上运行的训练进程"""
+    global global_step
+    writer = None
+    writer_eval = None
+    
+    try:
+        if rank == 0:
+            print(f" 在GPU {rank}上启动主训练进程")
+            logger = utils.get_logger(hps.model_dir)
+            logger.info(hps)
+            utils.check_git_hash(hps.model_dir)
+            
+            # TensorBoard初始化
+            writer = SummaryWriter(log_dir=dirs["version_dir"])
+            eval_log_dir = os.path.join(dirs["version_dir"], "eval")
+            os.makedirs(eval_log_dir, exist_ok=True)
+            writer_eval = SummaryWriter(log_dir=eval_log_dir)
+            print(f" TensorBoard日志路径: {dirs['version_dir']}")
+            print(f" 配置中的model_dir: {hps.model_dir}")
+            print(f" 查找检查点目录: {os.path.abspath(hps.model_dir)}")
+            print(f" G检查点: {utils.latest_checkpoint_path(hps.model_dir, 'G_*.pth')}")
+            print(f" D检查点: {utils.latest_checkpoint_path(hps.model_dir, 'D_*.pth')}")
+        
+        # 初始化分布式训练
+        dist.init_process_group(
+            backend='gloo' if os.name == 'nt' else 'nccl',
+            init_method='env://',
+            world_size=n_gpus,
+            rank=rank
+        )
+        
+        torch.manual_seed(hps.train.seed)
+        torch.cuda.set_device(rank)
+        
+        # 数据加载器
+        collate_fn = TextAudioCollate()
+        all_in_mem = hps.train.all_in_mem
+        train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps, all_in_mem=all_in_mem)
+        
+        num_workers = min(4, multiprocessing.cpu_count())  # 限制worker数量
+        if all_in_mem:
+            num_workers = 0
+            
+        train_loader = DataLoader(
+            train_dataset,
+            num_workers=num_workers,
+            shuffle=False,
+            pin_memory=True,
+            batch_size=hps.train.batch_size,
+            collate_fn=collate_fn
+        )
+        
+        if rank == 0:
+            eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps, all_in_mem=all_in_mem, vol_aug=False)
+            eval_loader = DataLoader(
+                eval_dataset,
+                num_workers=1,
+                shuffle=False,
+                batch_size=1,
+                pin_memory=False,
+                drop_last=False,
+                collate_fn=collate_fn
+            )
+
+        # 初始化模型
+        net_g = SynthesizerTrn(
+            hps.data.filter_length // 2 + 1,
+            hps.train.segment_size // hps.data.hop_length,
+            **hps.model
+        ).cuda(rank)
+        
+        net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+        
+        # 优化器
+        optim_g = torch.optim.AdamW(
+            net_g.parameters(),
+            hps.train.learning_rate,
+            betas=hps.train.betas,
+            eps=hps.train.eps
+        )
+        
+        optim_d = torch.optim.AdamW(
+            net_d.parameters(),
+            hps.train.learning_rate,
+            betas=hps.train.betas,
+            eps=hps.train.eps
+        )
+        
+        # 分布式数据并行
+        net_g = DDP(net_g, device_ids=[rank])
+        net_d = DDP(net_d, device_ids=[rank])
+
+        # ====== 自动恢复训练 ======
+        epoch_str = 1
+        global_step = 0
+        skip_optimizer = False
+        
+        try:
+            # 尝试加载生成器检查点
+            _, _, _, epoch_str = utils.load_checkpoint(
+                utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"),
+                net_g, optim_g, skip_optimizer
+            )
+            
+            # 尝试加载判别器检查点
+            _, _, _, epoch_str = utils.load_checkpoint(
+                utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"),
+                net_d, optim_d, skip_optimizer
+            )
+            
+            epoch_str = max(epoch_str, 1)
+            checkpoint_name = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
+            if checkpoint_name:
+                global_step = int(checkpoint_name[checkpoint_name.rfind("_")+1:checkpoint_name.rfind(".")]) + 1
+                
+            if rank == 0:
+                print(f" 从检查点恢复: epoch={epoch_str}, step={global_step}")
+                
+        except Exception as e:
+            if rank == 0:
+                print(f" 加载检查点失败: {e}, 从头开始训练")
+            epoch_str = 1
+            global_step = 0
+            
+        if skip_optimizer:
+            epoch_str = 1
+            global_step = 0
+        # =========================
+
+        # 学习率调度器
+        warmup_epoch = hps.train.warmup_epochs
+        scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+            optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2
+        )
+        
+        scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+            optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2
+        )
+
+        scaler = GradScaler(enabled=hps.train.fp16_run)
+
+        # 主训练循环
+        for epoch in range(epoch_str, hps.train.epochs + 1):
+            try:
+                # 预热学习率
+                if epoch <= warmup_epoch:
+                    for param_group in optim_g.param_groups:
+                        param_group['lr'] = hps.train.learning_rate / warmup_epoch * epoch
+                    for param_group in optim_d.param_groups:
+                        param_group['lr'] = hps.train.learning_rate / warmup_epoch * epoch
+                
+                # 训练和评估
+                if rank == 0:
+                    train_and_evaluate(
+                        rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], 
+                        [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], 
+                        logger, [writer, writer_eval], dirs
+                    )
+                else:
+                    train_and_evaluate(
+                        rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], 
+                        [scheduler_g, scheduler_d], scaler, [train_loader, None], 
+                        None, None, dirs
+                    )
+                
+                # 更新学习率
+                scheduler_g.step()
+                scheduler_d.step()
+                
+            except KeyboardInterrupt:
+                if rank == 0:
+                    print("\n 训练中断 - 保存当前模型状态...")
+                    save_interrupted_model(net_g, optim_g, net_d, optim_d, epoch, global_step, hps, dirs)
+                raise
+                
+    except Exception as e:
+        print(f" GPU {rank} 上的训练失败: {e}")
+        raise
+        
+    finally:
+        # 清理分布式进程组
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        
+        # 关闭TensorBoard写入器
+        if writer:
+            writer.close()
+        if writer_eval:
+            writer_eval.close()
+            
+        if rank == 0:
+            print(" 训练进程完成")
+
+def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, dirs):
+    """每个epoch的训练和评估循环"""
+    net_g, net_d = nets
+    optim_g, optim_d = optims
+    train_loader, eval_loader = loaders
+    writer, writer_eval = writers if writers else (None, None)
+    
+    half_type = torch.bfloat16 if hps.train.half_type == "bf16" else torch.float16
+    global global_step
+
+    net_g.train()
+    net_d.train()
+    
+    try:
+        for batch_idx, items in enumerate(train_loader):
+            try:
+                c, f0, spec, y, spk, lengths, uv, volume = items
+                g = spk.cuda(rank, non_blocking=True)
+                spec, y = spec.cuda(rank, non_blocking=True), y.cuda(rank, non_blocking=True)
+                c = c.cuda(rank, non_blocking=True)
+                f0 = f0.cuda(rank, non_blocking=True)
+                uv = uv.cuda(rank, non_blocking=True)
+                lengths = lengths.cuda(rank, non_blocking=True)
+                
+                # 计算梅尔频谱
+                mel = spec_to_mel_torch(
+                    spec,
+                    hps.data.filter_length,
+                    hps.data.n_mel_channels,
+                    hps.data.sampling_rate,
+                    hps.data.mel_fmin,
+                    hps.data.mel_fmax
+                )
+                
+                # 使用自动混合精度
+                with autocast(enabled=hps.train.fp16_run, dtype=half_type):
+                    # 生成器前向传播
+                    y_hat, ids_slice, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(
+                        c, f0, uv, spec, g=g, c_lengths=lengths, spec_lengths=lengths, vol=volume
+                    )
+
+                    # 切片处理
+                    y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
+                    y_hat_mel = mel_spectrogram_torch(
+                        y_hat.squeeze(1),
+                        hps.data.filter_length,
+                        hps.data.n_mel_channels,
+                        hps.data.sampling_rate,
+                        hps.data.hop_length,
+                        hps.data.win_length,
+                        hps.data.mel_fmin,
+                        hps.data.mel_fmax
+                    )
+                    y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size)
+
+                    # 判别器
+                    y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+
+                    # 计算判别器损失
+                    with autocast(enabled=False, dtype=half_type):
+                        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
+                        loss_disc_all = loss_disc
+                
+                # 判别器反向传播
+                optim_d.zero_grad()
+                scaler.scale(loss_disc_all).backward()
+                scaler.unscale_(optim_d)
+                grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+                scaler.step(optim_d)
+                
+                # 生成器训练
+                with autocast(enabled=hps.train.fp16_run, dtype=half_type):
+                    y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+                    
+                    # 计算生成器损失
+                    with autocast(enabled=False, dtype=half_type):
+                        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
+                        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
+                        loss_fm = feature_loss(fmap_r, fmap_g)
+                        loss_gen, losses_gen = generator_loss(y_d_hat_g)
+                        loss_lf0 = F.mse_loss(pred_lf0, lf0) if net_g.module.use_automatic_f0_prediction else 0
+                        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
+                
+                # 生成器反向传播
+                optim_g.zero_grad()
+                scaler.scale(loss_gen_all).backward()
+                scaler.unscale_(optim_g)
+                grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+                scaler.step(optim_g)
+                scaler.update()
+
+                # 主进程日志记录
+                if rank == 0:
+                    # 日志记录
+                    if global_step % hps.train.log_interval == 0:
+                        lr = optim_g.param_groups[0]['lr']
+                        losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
+                        reference_loss = sum(losses)
+                        
+                        logger.info(f"Epoch: {epoch} [{batch_idx}/{len(train_loader)}]")
+                        logger.info(f"Losses: {[x.item() for x in losses]}, step: {global_step}, lr: {lr:.6f}, ref: {reference_loss.item():.4f}")
+
+                        # 标量记录
+                        scalar_dict = {
+                            "loss/g/total": loss_gen_all.item(),
+                            "loss/d/total": loss_disc_all.item(),
+                            "learning_rate": lr,
+                            "grad_norm_d": grad_norm_d,
+                            "grad_norm_g": grad_norm_g,
+                            "loss/g/fm": loss_fm.item(),
+                            "loss/g/mel": loss_mel.item(),
+                            "loss/g/kl": loss_kl.item(),
+                            "loss/g/lf0": loss_lf0.item() if net_g.module.use_automatic_f0_prediction else 0
+                        }
+                        
+                        # 图像记录
+                        image_dict = {
+                            "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
+                            "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
+                            "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy())
+                        }
+
+                        if net_g.module.use_automatic_f0_prediction:
+                            image_dict.update({
+                                "all/lf0": utils.plot_data_to_numpy(
+                                    lf0[0, 0, :].cpu().numpy(),
+                                    pred_lf0[0, 0, :].detach().cpu().numpy()
+                                ),
+                                "all/norm_lf0": utils.plot_data_to_numpy(
+                                    lf0[0, 0, :].cpu().numpy(),
+                                    norm_lf0[0, 0, :].detach().cpu().numpy()
+                                )
+                            })
+
+                        # 写入TensorBoard
+                        utils.summarize(
+                            writer=writer,
+                            global_step=global_step,
+                            images=image_dict,
+                            scalars=scalar_dict
+                        )
+
+                    # ====== 自动保存点 ======
+                    if global_step % hps.train.eval_interval == 0:
+                        # 评估
+                        evaluate(hps, net_g, eval_loader, writer_eval)
+                        
+                        # 保存模型
+                        save_current_model(net_g, optim_g, net_d, optim_d, epoch, global_step, hps, dirs)
+                        
+                        # 清理旧检查点
+                        keep_ckpts = getattr(hps.train, 'keep_ckpts', 3)
+                        if keep_ckpts > 0:
+                            utils.clean_checkpoints(
+                                path_to_models=dirs["checkpoint_dir"], 
+                                n_ckpts_to_keep=keep_ckpts, 
+                                sort_by_time=True
+                            )
+                            utils.clean_checkpoints(
+                                path_to_models=dirs["save_dir"], 
+                                n_ckpts_to_keep=keep_ckpts, 
+                                sort_by_time=True
+                            )
+                    # =======================
+                
+                global_step += 1
+                
+            except KeyboardInterrupt:
+                if rank == 0:
+                    print("\n 批次处理中断 - 保存当前模型状态...")
+                    save_interrupted_model(net_g, optim_g, net_d, optim_d, epoch, global_step, hps, dirs)
+                raise
+                
+    except Exception as e:
+        print(f" 训练循环错误: {e}")
+        raise
+        
+    finally:
+        if rank == 0:
+            now = time.time()
+            duration = now - start_time
+            hours, rem = divmod(duration, 3600)
+            minutes, seconds = divmod(rem, 60)
+            time_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+            
+            logger.info(f"  Epoch {epoch} 完成, 耗时: {time_str}")
+            start_time = time.time()
+
+def save_current_model(net_g, optim_g, net_d, optim_d, epoch, global_step, hps, dirs):
+    """保存当前模型状态 - 自动保存点核心函数"""
+    checkpoint_dir = dirs["checkpoint_dir"]
+    save_dir = dirs["save_dir"]
+    
+    # 创建检查点目录
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 保存到checkpoint_dir
+    g_path = os.path.join(checkpoint_dir, f"G_{global_step}.pth")
+    d_path = os.path.join(checkpoint_dir, f"D_{global_step}.pth")
+    
+    utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, g_path)
+    utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, d_path)
+    
+    # 保存到save_dir
+    utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(save_dir, f"G_{global_step}.pth"))
+    utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(save_dir, f"D_{global_step}.pth"))
+    
+    print(f" 保存模型检查点: step={global_step}, epoch={epoch}")
+    print(f"  - G: {g_path}")
+    print(f"  - D: {d_path}")
+
+def save_interrupted_model(net_g, optim_g, net_d, optim_d, epoch, global_step, hps, dirs):
+    """中断时保存模型 - 自动恢复点"""
+    checkpoint_dir = dirs["checkpoint_dir"]
+    save_dir = dirs["save_dir"]
+    
+    # 创建检查点目录
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 保存中断模型
+    g_path = os.path.join(checkpoint_dir, f"G_interrupted_{global_step}.pth")
+    d_path = os.path.join(checkpoint_dir, f"D_interrupted_{global_step}.pth")
+    
+    utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, g_path)
+    utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, d_path)
+    
+    # 复制到save_dir
+    shutil.copy(g_path, os.path.join(save_dir, f"G_interrupted_{global_step}.pth"))
+    shutil.copy(d_path, os.path.join(save_dir, f"D_interrupted_{global_step}.pth"))
+    
+    print(f" 保存中断模型: step={global_step}, epoch={epoch}")
+    print(f"  - G: {g_path}")
+    print(f"  - D: {d_path}")
+
+def evaluate(hps, generator, eval_loader, writer_eval):
+    """模型评估函数"""
+    generator.eval()
+    image_dict = {}
+    audio_dict = {}
+    
+    with torch.no_grad():
+        for batch_idx, items in enumerate(eval_loader):
+            c, f0, spec, y, spk, _, uv, volume = items
+            g = spk[:1].cuda(0)
+            spec, y = spec[:1].cuda(0), y[:1].cuda(0)
+            c = c[:1].cuda(0)
+            f0 = f0[:1].cuda(0)
+            uv = uv[:1].cuda(0)
+            
+            if volume is not None:
+                volume = volume[:1].cuda(0)
+            
+            # 计算梅尔频谱
+            mel = spec_to_mel_torch(
+                spec,
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax
+            )
+            
+            # 推理生成
+            y_hat, _ = generator.module.infer(c, f0, uv, g=g, vol=volume)
+
+            # 生成梅尔频谱
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.squeeze(1).float(),
+                hps.data.filter_length,
+                hps.data.n_mel_channels,
+                hps.data.sampling_rate,
+                hps.data.hop_length,
+                hps.data.win_length,
+                hps.data.mel_fmin,
+                hps.data.mel_fmax
+            )
+
+            # 收集音频样本
+            audio_dict.update({
+                f"gen/audio_{batch_idx}": y_hat[0],
+                f"gt/audio_{batch_idx}": y[0]
+            })
+        
+        # 收集图像样本
+        image_dict.update({
+            "gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy()),
+            "gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())
+        })
+    
+    # 写入TensorBoard
+    utils.summarize(
+        writer=writer_eval,
+        global_step=global_step,
+        images=image_dict,
+        audios=audio_dict,
+        audio_sampling_rate=hps.data.sampling_rate
+    )
+    
+    generator.train()
+
+if __name__ == "__main__":
+    # 打印启动信息
+    print("=" * 80)
+    print(f"启动 so-vits-svc 训练 - 版本 4.1-Stable")
+    print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+
+    # 启动训练
+    main()
+
+    # 打印结束信息
+    print("=" * 80)
+    print(f"训练完成 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+    

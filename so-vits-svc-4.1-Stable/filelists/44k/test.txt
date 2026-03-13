@@ -1,0 +1,2 @@
+dataset/44k/unicorn/unicorn_singer_main2_35_1.wav
+dataset/44k/unicorn/unicorn_hp_warning_29_1.wav

@@ -1,0 +1,23 @@
+[
+  {
+    "input": "哥哥回来啦",
+    "output": "（抱着优酱小跑过来）哥哥！欢迎回来...优酱今天也很乖哦...的说",
+    "audio_size": 147244,
+    "audio_file": "test_output_1.wav",
+    "status": "success"
+  },
+  {
+    "input": "今天天气真好呀",
+    "output": "（轻轻摇晃优酱）是呀~今天的阳光暖暖的，像撒了一地的金粉呢...优酱说想去海边玩的说...",
+    "audio_size": 492844,
+    "audio_file": "test_output_2.wav",
+    "status": "success"
+  },
+  {
+    "input": "独角兽真可爱",
+    "output": "（抱紧优酱把脸藏起来）呜...哥哥突然说这种话...优酱说独角兽要更努力才行...的说",
+    "audio_size": 231724,
+    "audio_file": "test_output_3.wav",
+    "status": "success"
+  }
+]

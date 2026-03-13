@@ -1,0 +1,13 @@
+dataset/44k/unicorn\unicorn_singer_main3_36.wav|unicorn
+dataset/44k/unicorn\unicorn_unlock_03_1.wav|unicorn
+dataset/44k/unicorn\unicorn_spring_desc_39_1.wav|unicorn
+dataset/44k/unicorn\unicorn_feeling_friendly_19_1.wav|unicorn
+dataset/44k/unicorn\unicorn_upgrade_24.wav|unicorn
+dataset/44k/unicorn\unicorn_spring_main2_42_1.wav|unicorn
+dataset/44k/unicorn\unicorn_date_touch_49_1.wav|unicorn
+dataset/44k/unicorn\unicorn_main_4_09.wav|unicorn
+dataset/44k/unicorn\unicorn_main_1_06_1.wav|unicorn
+dataset/44k/unicorn\unicorn_lose_27.wav|unicorn
+dataset/44k/unicorn\unicorn_date_love_51_1.wav|unicorn
+dataset/44k/unicorn\unicorn_login_04.wav|unicorn
+dataset/44k/unicorn\unicorn_battle_25.wav|unicorn
